@@ -85,6 +85,7 @@ def get_args(
     )
     parser.add_argument("--perf", action="store_true", default=False)
     parser.add_argument("--vae-tiling", action="store_true", default=False)
+    parser.add_argument("--vae-dp", action="store_true", default=False)
     parser.add_argument("--cpu-offload", action="store_true", default=False)
     return parser.parse_args() if parse else parser
 

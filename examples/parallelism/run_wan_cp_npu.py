@@ -20,6 +20,7 @@ from utils import (
 )
 
 import cache_dit
+from cache_dit.npu_optim import npu_optimize
 
 
 def run_pipe(args, pipe, warmup: bool = False):
@@ -73,12 +74,15 @@ def main():
     else:
         pipe.to(device)
 
+    if args.vae_dp:
+        pipe.vae.enable_dp(world_size=8, hw_splits=(2, 4)) # , overlap_ratio=0.01, overlap_pixels=64)
+
     if args.vae_tiling:
         pipe.vae.enable_tiling(
-            tile_sample_min_height=int(args.height / 2 * 3),
-            tile_sample_min_width=int(args.width / 2 * 3),
-            tile_sample_stride_height=int(args.height / 2),
-            tile_sample_stride_width=int(args.width / 2),
+            # tile_sample_min_height=int(args.height / 2 * 3),
+            # tile_sample_min_width=int(args.width / 2 * 3),
+            # tile_sample_stride_height=int(args.height / 2),
+            # tile_sample_stride_width=int(args.width / 2),
         )
 
     assert isinstance(pipe.transformer, WanTransformer3DModel)
@@ -105,4 +109,10 @@ def main():
 
 
 if __name__ == "__main__":
+    npu_optimize([
+        "npu_fast_gelu",
+        "npu_rms_norm",
+        "npu_layer_norm_eval",
+        "npu_rotary_mul",
+    ])
     main()
