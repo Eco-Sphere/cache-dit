@@ -1,9 +1,10 @@
+import copy
 import torch
 from typing import Any, Tuple, List, Union, Optional
 from diffusers import DiffusionPipeline, ModelMixin
 from cache_dit.caching.cache_types import CacheType
 from cache_dit.caching.block_adapters import BlockAdapter
-from cache_dit.caching.block_adapters import BlockAdapterRegistry
+from cache_dit.caching.block_adapters import BlockAdapterRegister
 from cache_dit.caching.cache_adapters import CachedAdapter
 from cache_dit.caching.cache_contexts import BasicCacheConfig
 from cache_dit.caching.cache_contexts import DBCacheConfig
@@ -12,6 +13,7 @@ from cache_dit.caching.cache_contexts import CalibratorConfig
 from cache_dit.caching.params_modifier import ParamsModifier
 from cache_dit.parallelism import ParallelismConfig
 from cache_dit.parallelism import enable_parallelism
+from cache_dit.caching.utils import load_options
 
 from cache_dit.logger import init_logger
 
@@ -101,6 +103,11 @@ def enable_cache(
                 residual_diff_threshold (`float`, *required*, defaults to 0.08):
                     the value of residual diff threshold, a higher value leads to faster performance at the
                     cost of lower precision.
+                max_accumulated_residual_diff_threshold (`float`, *optional*, defaults to None):
+                    The maximum accumulated relative l1 diff threshold for Cache. If set, when the
+                    accumulated relative l1 diff exceeds this threshold, the caching strategy will be
+                    disabled for current step. This is useful for some cases where the input condition
+                    changes significantly in a single step. Default None means this feature is disabled.
                 max_warmup_steps (`int`, *required*, defaults to 8):
                     DBCache does not apply the caching strategy when the number of running steps is less than
                     or equal to this value, ensuring the model sufficiently learns basic features during warmup.
@@ -129,6 +136,15 @@ def enable_cache(
                     num_inference_steps for DiffusionPipeline, used to adjust some internal settings
                     for better caching performance. For example, we will refresh the cache once the
                     executed steps exceed num_inference_steps if num_inference_steps is provided.
+                steps_computation_mask (`List[int]`, *optional*, defaults to None):
+                    This param introduce LeMiCa/EasyCache style compute mask for steps. It is a list
+                    of length num_inference_steps indicating whether to compute each step or not.
+                    1 means must compute, 0 means use dynamic/static cache. If provided, will override
+                    other settings to decide whether to compute each step.
+                steps_computation_policy (`str`, *optional*, defaults to "dynamic"):
+                    The computation policy for steps when using steps_computation_mask. It can be
+                    "dynamic" or "static". "dynamic" means using dynamic cache for steps marked as 0
+                    in steps_computation_mask, while "static" means using static cache for those steps.
 
         calibrator_config (`CalibratorConfig`, *optional*, defaults to None):
             Config for calibrator. If calibrator_config is not None, it means the user wants to use DBCache
@@ -205,20 +221,14 @@ def enable_cache(
         "Bn_compute_blocks": kwargs.get("Bn_compute_blocks", None),
         "max_warmup_steps": kwargs.get("max_warmup_steps", None),
         "max_cached_steps": kwargs.get("max_cached_steps", None),
-        "max_continuous_cached_steps": kwargs.get(
-            "max_continuous_cached_steps", None
-        ),
+        "max_continuous_cached_steps": kwargs.get("max_continuous_cached_steps", None),
         "residual_diff_threshold": kwargs.get("residual_diff_threshold", None),
         "enable_separate_cfg": kwargs.get("enable_separate_cfg", None),
         "cfg_compute_first": kwargs.get("cfg_compute_first", None),
-        "cfg_diff_compute_separate": kwargs.get(
-            "cfg_diff_compute_separate", None
-        ),
+        "cfg_diff_compute_separate": kwargs.get("cfg_diff_compute_separate", None),
     }
 
-    deprecated_kwargs = {
-        k: v for k, v in deprecated_kwargs.items() if v is not None
-    }
+    deprecated_kwargs = {k: v for k, v in deprecated_kwargs.items() if v is not None}
 
     if deprecated_kwargs:
         logger.warning(
@@ -252,9 +262,7 @@ def enable_cache(
         calibrator_config = TaylorSeerCalibratorConfig(
             enable_calibrator=kwargs.get("enable_taylorseer"),
             enable_encoder_calibrator=kwargs.get("enable_encoder_taylorseer"),
-            calibrator_cache_type=kwargs.get(
-                "taylorseer_cache_type", "residual"
-            ),
+            calibrator_cache_type=kwargs.get("taylorseer_cache_type", "residual"),
             taylorseer_order=kwargs.get("taylorseer_order", 1),
         )
 
@@ -294,7 +302,9 @@ def enable_cache(
 
         transformers = []
         if isinstance(pipe_or_adapter, DiffusionPipeline):
-            adapter = BlockAdapterRegistry.get_adapter(pipe_or_adapter)
+            adapter = BlockAdapterRegister.get_adapter(
+                pipe_or_adapter, skip_post_init=cache_config is None
+            )
             if adapter is None:
                 assert hasattr(pipe_or_adapter, "transformer"), (
                     "The given DiffusionPipeline does not have "
@@ -307,15 +317,12 @@ def enable_cache(
                 transformers = BlockAdapter.flatten(adapter.transformer)
         else:
             if not BlockAdapter.is_normalized(pipe_or_adapter):
-                pipe_or_adapter = BlockAdapter.normalize(
-                    pipe_or_adapter, unique=False
-                )
+                pipe_or_adapter = BlockAdapter.normalize(pipe_or_adapter, unique=False)
             transformers = BlockAdapter.flatten(pipe_or_adapter.transformer)
 
         if len(transformers) == 0:
             logger.warning(
-                "No transformer is detected in the "
-                "BlockAdapter, skip enabling parallelism."
+                "No transformer is detected in the " "BlockAdapter, skip enabling parallelism."
             )
             return pipe_or_adapter
 
@@ -327,10 +334,55 @@ def enable_cache(
             )
         for i, transformer in enumerate(transformers):
             # Enable parallelism for the transformer inplace
-            transformers[i] = enable_parallelism(
-                transformer, parallelism_config
-            )
+            transformers[i] = enable_parallelism(transformer, parallelism_config)
     return pipe_or_adapter
+
+
+def refresh_context(transformer: torch.nn.Module, **force_refresh_kwargs):
+    r"""Refresh cache context for the given transformer. This is useful when
+    the users run into transformer-only case with dynamic num_inference_steps.
+    For example, when num_inference_steps changes significantly between different
+    requests, the cache context should be refreshed to avoid potential
+    precision degradation. Usage:
+    ```py
+    >>> import cache_dit
+    >>> from cache_dit import DBCacheConfig
+    >>> from diffusers import DiffusionPipeline
+    >>> # Init cache context with num_inference_steps=None (default)
+    >>> pipe = DiffusionPipeline.from_pretrained("Qwen/Qwen-Image")
+    >>> pipe = cache_dit.enable_cache(pipe.transformer, cache_config=DBCacheConfig(...))
+    >>> # Assume num_inference_steps is 28, and we want to refresh the context
+    >>> cache_dit.refresh_context(transformer, num_inference_steps=28, verbose=True)
+    >>> output = pipe(...) # Just call the pipe as normal.
+    >>> stats = cache_dit.summary(pipe.transformer) # Then, get the summary
+    >>> # Update the cache context with new num_inference_steps=50.
+    >>> cache_dit.refresh_context(pipe.transformer, num_inference_steps=50, verbose=True)
+    >>> output = pipe(...) # Just call the pipe as normal.
+    >>> stats = cache_dit.summary(pipe.transformer) # Then, get the summary
+    >>> # Update the cache context with new cache_config.
+    >>> cache_dit.refresh_context(
+        pipe.transformer,
+        cache_config=DBCacheConfig(
+            residual_diff_threshold=0.1,
+            max_warmup_steps=10,
+            max_cached_steps=20,
+            max_continuous_cached_steps=4,
+            num_inference_steps=50,
+        ),
+        verbose=True,
+    )
+    >>> output = pipe(...) # Just call the pipe as normal.
+    >>> stats = cache_dit.summary(pipe.transformer) # Then, get the summary
+    ```
+    """
+    if force_refresh_kwargs:
+        if "cache_config" not in force_refresh_kwargs:
+            verbose = force_refresh_kwargs.pop("verbose", False)
+            # Assume force_refresh_kwargs is passed as dict, e.g.,
+            # {"num_inference_steps": 50}
+            force_refresh_kwargs = load_options(force_refresh_kwargs, reset=True)
+            force_refresh_kwargs["verbose"] = verbose
+    CachedAdapter.maybe_refresh_context(transformer, **force_refresh_kwargs)
 
 
 def disable_cache(
@@ -340,19 +392,295 @@ def disable_cache(
     ],
 ):
     CachedAdapter.maybe_release_hooks(pipe_or_adapter)
-    logger.warning(
-        f"Cache Acceleration is disabled for: "
-        f"{pipe_or_adapter.__class__.__name__}."
-    )
+    logger.warning(f"Cache Acceleration is disabled for: " f"{pipe_or_adapter.__class__.__name__}.")
 
 
 def supported_pipelines(
     **kwargs,
 ) -> Tuple[int, List[str]]:
-    return BlockAdapterRegistry.supported_pipelines(**kwargs)
+    return BlockAdapterRegister.supported_pipelines(**kwargs)
 
 
 def get_adapter(
     pipe: DiffusionPipeline | str | Any,
 ) -> BlockAdapter:
-    return BlockAdapterRegistry.get_adapter(pipe)
+    return BlockAdapterRegister.get_adapter(pipe)
+
+
+def _steps_mask(
+    compute_bins: List[int],
+    cache_bins: List[int],
+    total_steps: Optional[int] = None,
+) -> list[int]:
+    mask = []
+    step = 0
+    compute_bins = compute_bins.copy()
+    cache_bins = cache_bins.copy()
+    # reverse to use as stacks
+    compute_bins.reverse()
+    cache_bins.reverse()
+
+    if total_steps is not None:
+        assert (
+            sum(compute_bins) + sum(cache_bins) >= total_steps
+        ), "The sum of compute and cache intervals must be at least total_steps."
+    else:
+        total_steps = sum(compute_bins) + sum(cache_bins)
+
+    while step < total_steps:
+
+        if compute_bins:
+            ci = compute_bins.pop()
+            mask.extend([1] * ci)
+            step += ci
+        if cache_bins:
+            cai = cache_bins.pop()
+            mask.extend([0] * cai)
+            step += cai
+
+        if step >= total_steps:
+            break
+
+    return mask[:total_steps]
+
+
+def steps_mask(
+    compute_bins: Optional[List[int]] = None,
+    cache_bins: Optional[List[int]] = None,
+    total_steps: Optional[int] = None,
+    mask_policy: Optional[str] = "medium",
+) -> list[int]:
+    r"""
+    Define a step computation mask based on compute and cache bins.
+
+    Args:
+        compute_bins (`List[int]`, *optional*, defaults to None):
+            A list specifying the number of consecutive steps to compute.
+            For example, [4, 2] means compute 4 steps, then 2 steps.
+        cache_bins (`List[int]`, *optional*, defaults to None):
+            A list specifying the number of consecutive steps to cache.
+            For example, [2, 4] means cache 2 steps, then 4 steps.
+        total_steps (`int`, *optional*, defaults to None):
+            Total number of steps for which the mask is generated.
+            If provided, the sum of compute_bins and cache_bins must be at
+            least total_steps.
+        mask_policy (`str`, *optional*, defaults to "medium"):
+            Predefined mask policy. Options are "slow", "medium", "fast", "ultra".
+            For examples, if total_steps=28, each policy corresponds to specific
+            compute and cache bin configurations:
+                - "slow": compute_bins=[8, 3, 3, 2, 1, 1], cache_bins=1, 2, 2, 2, 3]
+                - "medium": compute_bins=[6, 2, 2, 2, 2, 1], cache_bins=[1, 3, 3, 3, 3]
+                - "fast": compute_bins=[6, 1, 1, 1, 1], cache_bins=[1, 3, 4, 5, 4]
+                - "ultra": compute_bins=[4, 1, 1, 1, 1], cache_bins=[2, 5, 6, 7]
+    Returns:
+        `List[int]`: A list representing the step computation mask, where 1
+        indicates a compute step and 0 indicates a cache step.
+    """
+    # Prefer compute/cache bins if both are provided
+    if compute_bins is not None and cache_bins is not None:
+        return _steps_mask(
+            compute_bins=compute_bins,
+            cache_bins=cache_bins,
+            total_steps=total_steps,
+        )
+
+    assert (
+        total_steps is not None
+    ), "total_steps must be provided when using predefined mask_policy."
+    # 28 steps predefined policies
+    predefined_policies = {
+        # NOTE: last step will never cache by default
+        # mask: 11111111 0 111 00 111 00 11 00 1 000 1
+        "slow": [
+            [8, 3, 3, 2, 1, 1],  # = 18 compute steps
+            [1, 2, 2, 2, 3],  # = 10 cache steps
+        ],
+        "medium": [
+            [6, 2, 2, 2, 2, 1],  # = 15 compute steps
+            [1, 3, 3, 3, 3],  # = 13 cache steps
+        ],
+        "fast": [
+            [6, 1, 1, 1, 1, 1],  # = 11 compute steps
+            [1, 3, 4, 5, 4],  # = 17 cache steps
+        ],
+        "ultra": [
+            [4, 1, 1, 1, 1],  # = 8 compute steps
+            [2, 5, 6, 7],  # = 20 cache steps
+        ],
+    }
+
+    def _sum_policy(policy: List[List[int]]) -> int:
+        return sum(policy[0]) + sum(policy[1])
+
+    def _truncate_policy(policy: List[List[int]], target_steps: int) -> List[List[int]]:
+        compute_bins, cache_bins = policy  # reference only
+        while _sum_policy(policy) > target_steps:
+            if cache_bins:
+                cache_bins[-1] -= 1
+                if cache_bins[-1] == 0:
+                    cache_bins.pop()
+            if _sum_policy(policy) <= target_steps:
+                break
+            if compute_bins:
+                compute_bins[-1] -= 1
+                if compute_bins[-1] == 0:
+                    compute_bins.pop()
+            if _sum_policy(policy) <= target_steps:
+                break
+        return [compute_bins, cache_bins]
+
+    def _truncate_predefined_policies(
+        policies: dict[str, List[List[int]]],
+        target_steps: int,
+    ) -> dict[str, List[List[int]]]:
+        truncated_policies = {}
+        for name, policy in policies.items():
+            truncated_policies[name] = _truncate_policy(policy, target_steps)
+        return truncated_policies
+
+    if total_steps > 28:
+        # Expand bins if total_steps exceed predefined sum
+        # For example, for total_steps=50, we will expand the bins
+        # of each policy until they can cover total_steps.
+        # This ensures the relative ratio of compute/cache steps
+        # remains consistent with the predefined policies.
+        for policy in predefined_policies.values():
+            min_bins_len = min(len(policy[0]), len(policy[1]))
+            compute_bins = copy.deepcopy(policy[0])
+            cache_bins = copy.deepcopy(policy[1])
+            while _sum_policy(policy) < total_steps:
+                for i in range(min_bins_len):
+                    # Add 1 to each compute bin, e.g., total_steps=50,
+                    # slow: 8 -> 8 + int(8 * (50 / 28) * 0.5) = 14
+                    #       3 -> 3 + int(3 * (50 / 28) * 0.5) = 5
+                    # fast: 6 -> 6 + int(6 * (50 / 28) * 0.5) = 11
+                    #       1 -> 1 + int(1 * (50 / 28) * 0.5) = 2
+                    policy[0][i] += max(int(compute_bins[i] * ((total_steps / 28) * 0.5)), 1)
+                    if _sum_policy(policy) >= total_steps:
+                        break
+                    # Add 1 to each cache bin, e.g., total_steps=50,
+                    # slow: 1 -> 1 + int(1 * (50 / 28) * 0.5) = 2
+                    #       2 -> 2 + int(2 * (50 / 28) * 0.5) = 4
+                    # fast: 1 -> 1 + int(1 * (50 / 28) * 0.5) = 2
+                    #       3 -> 3 + int(3 * (50 / 28) * 0.5) = 5
+                    policy[1][i] += max(int(cache_bins[i] * ((total_steps / 28) * 0.5)), 1)
+                    if _sum_policy(policy) >= total_steps:
+                        break
+                if _sum_policy(policy) >= total_steps:
+                    break
+                # compute bin due to compute_bins always longer than cache_bins
+                policy[0][-1] += 1
+                if _sum_policy(policy) >= total_steps:
+                    break
+
+        # truncate to exact total_steps
+        predefined_policies = _truncate_predefined_policies(
+            predefined_policies,
+            total_steps,
+        )
+
+    elif total_steps < 28 and total_steps >= 16:
+        # Truncate bins to fit total_steps
+        predefined_policies = _truncate_predefined_policies(
+            predefined_policies,
+            total_steps,
+        )
+    elif total_steps < 16 and total_steps >= 8:
+        # Mainly for distilled models with less steps, use smaller compute/cache bins
+        if total_steps > 8:
+            predefined_policies = {
+                "slow": [
+                    [4, 2, 2, 2, 1],  # = 11
+                    [1, 1, 1, 1],  # = 4
+                ],
+                "medium": [
+                    [4, 2, 1, 1, 1],  # = 9
+                    [1, 1, 2, 2],  # = 6
+                ],
+                "fast": [
+                    [3, 1, 1, 1, 1],  # = 7
+                    [1, 2, 2, 3],  # = 8
+                ],
+                "ultra": [
+                    [2, 1, 1, 1, 1],  # = 6
+                    [1, 2, 3, 3],  # = 9
+                ],
+            }
+            # Specifical case for Z-Image-Turbo with 9 steps
+            if total_steps == 9:
+                predefined_policies = {
+                    "slow": [
+                        [5, 2, 1],  # = 8
+                        [1],  # = 1
+                    ],
+                    "medium": [
+                        [5, 1, 1],  # = 7
+                        [1, 1],  # = 2
+                    ],
+                    "fast": [
+                        [4, 1, 1],  # = 6
+                        [1, 2],  # = 3
+                    ],
+                    "ultra": [
+                        [3, 1, 1],  # = 5
+                        [2, 2],  # = 4
+                    ],
+                }
+        else:  # total_steps == 8
+            # cases: 8 steps distilled models
+            predefined_policies = {
+                "slow": [
+                    [5, 1, 1],  # = 7
+                    [1],  # = 1
+                ],
+                "medium": [
+                    [4, 1, 1],  # = 6
+                    [1, 1],  # = 2
+                ],
+                "fast": [
+                    [3, 1, 1],  # = 5
+                    [1, 2],  # = 3
+                ],
+                "ultra": [
+                    [2, 1, 1],  # = 4
+                    [2, 2],  # = 4
+                ],
+            }
+        for policy in predefined_policies.values():
+            predefined_policies = _truncate_predefined_policies(
+                predefined_policies,
+                total_steps,
+            )
+    elif total_steps < 8:
+        # case: 4 or 6 steps distilled models
+        assert total_steps in (4, 6), (
+            "Only total_steps=4 or 6 is supported for predefined masks "
+            f"while total_steps < 8. Got total_steps={total_steps}."
+        )
+        constant_plicy_4_steps = [[2, 1], [1]]
+        constant_plicy_6_steps = [[3, 1], [2]]
+        if total_steps == 4:
+            constant_plicy = constant_plicy_4_steps
+        else:
+            constant_plicy = constant_plicy_6_steps
+
+        predefined_policies = {
+            "slow": constant_plicy,
+            "medium": constant_plicy,
+            "fast": constant_plicy,
+            "ultra": constant_plicy,
+        }
+
+    if mask_policy not in predefined_policies:
+        raise ValueError(
+            f"mask_policy {mask_policy} is not valid. "
+            f"Choose from {list(predefined_policies.keys())}."
+        )
+    compute_bins, cache_bins = predefined_policies[mask_policy]
+    # Will truncate if exceeded total_steps
+    compute_mask = _steps_mask(
+        compute_bins=compute_bins, cache_bins=cache_bins, total_steps=total_steps
+    )
+    # Force last step to compute
+    compute_mask[-1] = 1
+    return compute_mask

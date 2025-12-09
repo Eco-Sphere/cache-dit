@@ -15,6 +15,8 @@ from utils import (
     cachify,
     maybe_init_distributed,
     maybe_destroy_distributed,
+    MemoryTracker,
+    create_profiler_from_args,
 )
 import cache_dit
 
@@ -25,27 +27,52 @@ print(args)
 rank, device = maybe_init_distributed(args)
 
 pipe: FluxPipeline = FluxPipeline.from_pretrained(
-    os.environ.get(
-        "FLUX_DIR",
-        "black-forest-labs/FLUX.1-dev",
+    (
+        args.model_path
+        if args.model_path is not None
+        else os.environ.get(
+            "FLUX_DIR",
+            "black-forest-labs/FLUX.1-dev",
+        )
     ),
     torch_dtype=torch.bfloat16,
-).to("cuda")
+)
 
 if args.cache or args.parallel_type is not None:
-    cachify(args, pipe)
+    cachify(
+        args,
+        pipe,
+        extra_parallel_modules=(
+            # Specify extra modules to be parallelized in addition to the main transformer,
+            # e.g., text_encoder_2 in FluxPipeline, text_encoder in Flux2Pipeline. Currently,
+            # only supported in native pytorch backend (namely, Tensor Parallelism).
+            [pipe.text_encoder_2]
+            if args.parallel_type == "tp"
+            else []
+        ),
+    )
+
+pipe.to(device)
 
 assert isinstance(pipe.transformer, FluxTransformer2DModel)
 
 pipe.set_progress_bar_config(disable=rank != 0)
 
+# Set default prompt
+prompt = "A cat holding a sign that says hello world"
+if args.prompt is not None:
+    prompt = args.prompt
 
-def run_pipe(pipe: FluxPipeline):
+
+def run_pipe(warmup: bool = False):
+    steps = 5 if warmup else (28 if args.steps is None else args.steps)
+    if args.profile and args.steps is None and not warmup:
+        steps = 3
     image = pipe(
-        "A cat holding a sign that says hello world",
+        prompt,
         height=1024 if args.height is None else args.height,
         width=1024 if args.width is None else args.width,
-        num_inference_steps=28 if args.steps is None else args.steps,
+        num_inference_steps=steps,
         generator=torch.Generator("cpu").manual_seed(0),
     ).images[0]
     return image
@@ -56,11 +83,26 @@ if args.compile:
     pipe.transformer = torch.compile(pipe.transformer)
 
 # warmup
-_ = run_pipe(pipe)
+_ = run_pipe(warmup=True)
+
+memory_tracker = MemoryTracker() if args.track_memory else None
+if memory_tracker:
+    memory_tracker.__enter__()
 
 start = time.time()
-image = run_pipe(pipe)
+if args.profile:
+    profiler = create_profiler_from_args(args, profile_name="flux_tp_inference")
+    with profiler:
+        image = run_pipe()
+    if rank == 0:
+        print(f"Profiler traces saved to: {profiler.output_dir}/{profiler.trace_path.name}")
+else:
+    image = run_pipe()
 end = time.time()
+
+if memory_tracker:
+    memory_tracker.__exit__(None, None, None)
+    memory_tracker.report()
 
 if rank == 0:
     cache_dit.summary(pipe)

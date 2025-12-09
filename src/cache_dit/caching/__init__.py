@@ -7,7 +7,7 @@ from cache_dit.caching.params_modifier import ParamsModifier
 from cache_dit.caching.patch_functors import PatchFunctor
 
 from cache_dit.caching.block_adapters import BlockAdapter
-from cache_dit.caching.block_adapters import BlockAdapterRegistry
+from cache_dit.caching.block_adapters import BlockAdapterRegister
 from cache_dit.caching.block_adapters import FakeDiffusionPipeline
 
 from cache_dit.caching.cache_contexts import BasicCacheConfig
@@ -29,8 +29,10 @@ from cache_dit.caching.cache_blocks import UnifiedBlocks
 from cache_dit.caching.cache_adapters import CachedAdapter
 
 from cache_dit.caching.cache_interface import enable_cache
+from cache_dit.caching.cache_interface import refresh_context
 from cache_dit.caching.cache_interface import disable_cache
 from cache_dit.caching.cache_interface import supported_pipelines
 from cache_dit.caching.cache_interface import get_adapter
+from cache_dit.caching.cache_interface import steps_mask
 
 from cache_dit.caching.utils import load_options
