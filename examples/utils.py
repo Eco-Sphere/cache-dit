@@ -131,6 +131,7 @@ def get_args(
             # Based on this fix: https://github.com/huggingface/diffusers/pull/12563
             "native",  # native pytorch attention: sdpa
             "_native_cudnn",
+            "_native_npu",
             # '_sdpa_cudnn' is only in cache-dit to support context parallelism
             # with attn masks, e.g., ZImage. It is not in diffusers yet.
             "_sdpa_cudnn",
@@ -191,6 +192,9 @@ def get_args(
     )
     parser.add_argument("--profile-with-stack", action="store_true", default=True)
     parser.add_argument("--profile-record-shapes", action="store_true", default=True)
+    parser.add_argument("--vae-tiling", action="store_true", default=False)
+    parser.add_argument("--vae-dp", action="store_true", default=False)
+    parser.add_argument("--cpu-offload", action="store_true", default=False)
     args_or_parser = parser.parse_args() if parse else parser
     if parse:
         if args_or_parser.quantize_type == "bnb_4bit":  # alias
